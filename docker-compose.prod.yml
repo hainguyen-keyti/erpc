@@ -1,0 +1,91 @@
+# =============================================================================
+# docker-compose.prod.yml — production eRPC gateway stack for the AA-hunter chains.
+#
+# Quick start on the server:
+#   cp erpc.env.example .env          # then fill in keys (blank = pure public RPC)
+#   docker compose -f docker-compose.prod.yml up -d            # erpc + redis
+#   docker compose -f docker-compose.prod.yml --profile monitoring up -d   # + Grafana/Prometheus
+#   ./erpc-server validate --config erpc.yaml   # (or /tmp/erpc-bin) sanity-check config first
+#
+# Security: RPC (4000) + metrics (4001) bind to 127.0.0.1 on the HOST — NOT exposed
+# to the internet. Same-host clients (e.g. the scanner) reach http://127.0.0.1:4000/main/evm/<chainId>.
+# To expose remotely: put a reverse proxy (caddy/nginx + TLS) in front AND enable
+# `auth` in erpc.yaml. Never open 4000 to 0.0.0.0 without auth.
+# =============================================================================
+
+services:
+  erpc:
+    # Build from THIS repo (faithful to your fork). For a faster deploy with no build
+    # toolchain on the server, comment `build` and use the published image instead.
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # image: ghcr.io/erpc/erpc:main
+    # platform: linux/amd64
+    container_name: erpc
+    restart: always
+    command: ["/erpc-server", "--config", "/erpc.yaml"]
+    volumes:
+      - ./erpc.yaml:/erpc.yaml:ro
+    environment:
+      # From the host env or a `.env` file next to this compose. Unset => empty =>
+      # that keyed provider stays inert (config still boots on pure public RPC).
+      - ENVIO_API_KEY=${ENVIO_API_KEY:-}
+      - ALCHEMY_API_KEY=${ALCHEMY_API_KEY:-}
+      - DRPC_API_KEY=${DRPC_API_KEY:-}
+      - ERPC_AUTH_SECRET=${ERPC_AUTH_SECRET:-}
+    ports:
+      - "127.0.0.1:4000:4000"   # RPC   — host-only
+      - "127.0.0.1:4001:4001"   # metrics — host-only (Prometheus scrape target)
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks: [erpc]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  redis:
+    image: redis:7-alpine
+    container_name: erpc-redis
+    restart: always
+    # appendonly => cache survives redis restarts; LRU cap bounds memory.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "1gb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks: [erpc]
+    # no host port — only reachable inside the `erpc` network by the erpc service
+
+  # Optional observability (opt-in): docker compose ... --profile monitoring up -d
+  monitoring:
+    profiles: ["monitoring"]
+    build: ./monitoring
+    container_name: erpc-monitoring
+    restart: always
+    environment:
+      - SERVICE_ENDPOINT=erpc      # scrape the erpc container by service name
+      - SERVICE_PORT=4001
+    ports:
+      - "127.0.0.1:3000:3000"      # Grafana
+      - "127.0.0.1:9090:9090"      # Prometheus
+    volumes:
+      - ./monitoring/grafana/grafana.ini:/etc/grafana/grafana.ini
+      - ./monitoring/grafana/dashboards:/etc/grafana/dashboards
+      - prometheus_data:/prometheus
+      - grafana_data:/var/lib/grafana
+    depends_on: [erpc]
+    networks: [erpc]
+
+networks:
+  erpc:
+    driver: bridge
+
+volumes:
+  redis_data:
+  prometheus_data:
+  grafana_data:
