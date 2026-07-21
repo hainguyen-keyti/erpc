@@ -1,0 +1,773 @@
+# =============================================================================
+# erpc.yaml — STAGING gateway on the shared EC2 (rpc.7kt.org/<slug>)
+# Runs in /home/ubuntu/erpc/ via docker-compose.yml, behind the existing predix-nginx.
+# Slugs map to eRPC network aliases: rpc.7kt.org/base-sepolia -> /main/base-sepolia.
+#
+# 2026-07-21: extended to 29 networks (24 mainnet + 5 testnet) and AUTH ENABLED on
+# project `main` (network allowlist + secret). project `plinko` stays open. Set
+# ERPC_AUTH_SECRET in .env before restart (empty => all credentials rejected, fail-closed).
+# =============================================================================
+
+logLevel: info
+
+database:
+  evmJsonRpcCache:
+    connectors:
+      - id: memory-cache
+        driver: memory
+        memory:
+          maxItems: 100000
+          maxTotalSize: "256MB"
+      - id: redis-cache
+        driver: redis
+        redis:
+          addr: redis://erpc-redis-gw:6379   # my own redis container (erpc_internal network)
+    policies:
+      - connector: memory-cache
+        network: "*"
+        method: "eth_simulateV1"
+        finality: unfinalized
+        ttl: 30s
+      - connector: redis-cache
+        network: "*"
+        method: "eth_simulateV1"
+        finality: finalized
+        ttl: 0
+      - connector: redis-cache
+        network: "*"
+        method: "eth_getLogs"
+        finality: finalized
+        ttl: 0
+      - connector: redis-cache
+        network: "*"
+        method: "eth_getCode|eth_getStorageAt"
+        finality: finalized
+        ttl: 0
+      # ---- indexer read methods (immutable once finalized) ----
+      - connector: redis-cache
+        network: "*"
+        method: "eth_getBlockByNumber|eth_getBlockByHash|eth_getBlockReceipts|eth_getTransactionReceipt|eth_getTransactionByHash"
+        finality: finalized
+        ttl: 0
+      # ---- realtime head-block cache (2s) — collapse repeated head polling (indexers/dApps) ----
+      - connector: memory-cache
+        network: "*"
+        method: "eth_getBlockByNumber"
+        finality: realtime
+        ttl: 2s
+
+server:
+  httpHostV4: 0.0.0.0
+  httpPortV4: 4000
+  maxTimeout: 60s
+  waitBeforeShutdown: 30s
+  waitAfterShutdown: 10s
+  includeErrorDetails: false        # don't echo upstream error internals (URLs/keys) to clients
+  trustedIPHeaders: ["X-Real-IP", "CF-Connecting-IP"]   # X-Real-IP = nginx $remote_addr (real client; cf-real-ip snippet sets it behind CF) — primary source for the auth IP allowlist
+  trustedIPForwarders:              # peers trusted to set the headers above (localhost + predix docker net + Cloudflare edge)
+    - "127.0.0.1/8"
+    - "::1/128"
+    - "172.18.0.0/16"               # predix docker network: predix-nginx (172.18.0.10) proxies to erpc-gateway from here
+    - "173.245.48.0/20"
+    - "103.21.244.0/22"
+    - "103.22.200.0/22"
+    - "103.31.4.0/22"
+    - "141.101.64.0/18"
+    - "108.162.192.0/18"
+    - "190.93.240.0/20"
+    - "188.114.96.0/20"
+    - "197.234.240.0/22"
+    - "198.41.128.0/17"
+    - "162.158.0.0/15"
+    - "104.16.0.0/13"
+    - "104.24.0.0/14"
+    - "172.64.0.0/13"
+    - "131.0.72.0/22"
+
+metrics:
+  enabled: true
+  hostV4: 0.0.0.0
+  port: 4001
+  histogramDropLabels: ["user", "agent_name"]   # reduce Prometheus cardinality
+
+rateLimiters:
+  budgets:
+    - id: public-node
+      rules:
+        - method: "eth_getLogs"
+          maxCount: 8
+          period: second
+        - method: "*"
+          maxCount: 25
+          period: second
+    - id: envio-budget
+      rules:
+        - method: "*"
+          maxCount: 40
+          period: second
+    - id: keyed-node
+      rules:
+        - method: "*"
+          maxCount: 50
+          period: second
+
+projects:
+  - id: main
+
+    cors:                           # browser dApps: ONLY our domains (+their subdomains) may call
+      allowedOrigins:
+        - "https://feliciastation.com"
+        - "https://*.feliciastation.com"
+        - "https://7kt.org"
+        - "https://*.7kt.org"
+        - "https://predixpro.io"
+        - "https://*.predixpro.io"
+      allowedMethods: ["GET", "POST", "OPTIONS"]
+      allowedHeaders: ["content-type", "authorization", "x-erpc-secret-token"]
+      maxAge: 7200                  # cache preflight 2h (Chrome's cap) — fewer OPTIONS round-trips
+
+    # ---- AUTH (project `main` only; other projects e.g. `plinko` keep their open lane) ----
+    # OR-composed: a request passes if EITHER strategy authorizes.
+    #   network: a no-credential request is allowed ONLY from localhost or an allowlisted IP.
+    #     Each entry is a single host address (/32). NEVER widen to a /16 or /24 — this box is
+    #     multi-tenant (predix / plinko / indexer containers share these bridges) and a subnet
+    #     allowlist would let every container call this project unauthenticated.
+    #       54.179.230.27 = this EC2's public IP — the Price Pinball / same-host scanner reaching
+    #         the gateway through Cloudflare + nginx. Needs NO change on its side.
+    #       172.22.0.1    = the erpc_internal docker bridge GATEWAY, i.e. processes on the HOST
+    #         hitting the published 127.0.0.1:4000 port. Docker's userland proxy SNATs those
+    #         connections, so eRPC sees the bridge gateway and NOT 127.0.0.1 — which is exactly
+    #         why `allowLocalhost` alone does NOT cover host-local callers. Verified:
+    #         `docker-proxy -host-ip 127.0.0.1 -host-port 4000 -container-ip 172.22.0.5`, and the
+    #         live conn is 172.22.0.1 -> 172.22.0.5:4000. This lets the on-host aggregator/probes
+    #         call without embedding the secret in a URL (secrets in URLs leak into job records).
+    #         Safe because: the port binds 127.0.0.1 ONLY (containers cannot reach it at all), and
+    #         a container cannot source-spoof the gateway address over a real TCP handshake.
+    #       172.18.0.1    = the predix bridge gateway. Not used today (the port publishes on the
+    #         erpc_internal IP), listed pre-emptively: erpc-gateway sits on BOTH bridges, so a
+    #         future recreate could republish the port on the predix IP and silently flip the
+    #         source to 172.18.0.1 — which would 401 the on-host aggregator with no obvious cause.
+    #         Same security class as 172.22.0.1 (a host-side gateway address, unreachable and
+    #         unspoofable from containers), so listing both costs nothing and removes that trap.
+    #         Check which one is live: pgrep -af docker-proxy | grep 4000   (-container-ip 172.22.x
+    #         => source 172.22.0.1;  -container-ip 172.18.x => source 172.18.0.1)
+    #     eRPC resolves the real client IP from nginx's X-Real-IP (server.trustedIPForwarders
+    #     trusts the predix net); spoofing is blocked (rightmost-untrusted). NOTE: an EC2 IP can
+    #     change — move that consumer to the secret for a durable setup.
+    #   secret: everyone else presents ${ERPC_AUTH_SECRET} — Basic-auth password
+    #     (https://x:SECRET@rpc.7kt.org/<slug>), header X-ERPC-Secret-Token, or ?secret=.
+    # No secret + non-allowlisted IP => REJECTED. Empty ERPC_AUTH_SECRET => every credential
+    # rejected (fail-closed, never silently open).
+    auth:
+      strategies:
+        - type: network
+          network:
+            allowLocalhost: true
+            allowedIPs:
+              - "54.179.230.27"     # this EC2's public IP (Pinball / scanner, via Cloudflare+nginx)
+              - "172.22.0.1"        # erpc_internal bridge gateway = on-host callers via 127.0.0.1:4000 (docker SNAT) — the live one
+              - "172.18.0.1"        # predix bridge gateway — same host, pre-listed so a recreate that flips the published bridge can't silently 401 on-host callers
+        - type: secret
+          secret:
+            id: main
+            value: ${ERPC_AUTH_SECRET}
+
+    scoreMetricsWindowSize: 30s
+    upstreamDefaults:
+      evm:
+        statePollerInterval: 15s
+        getLogsAutoSplittingRangeThreshold: 2000  # split getLogs ranges >2000 blocks proactively
+
+    networkDefaults:
+      directiveDefaults:
+        validateLogsBloomEmptiness: true   # logs exist => bloom!=0 (catch a node dropping logs)
+        validateLogFields: true            # structural log validation
+        validateTransactionFields: true          # structural tx validation
+        validateLogsBloomMatch: true             # recompute bloom from logs — strongest "node dropped logs" check
+        enforceLogIndexStrictIncrements: true    # logIndex must strictly increase (catch reordered/missing logs)
+        validateTransactionsRoot: true           # BSC phantom-tx detection
+        enforceHighestBlock: true                # never serve a stale head from a lagging free node
+      evm:
+        getLogsMaxAllowedRange: 10000   # hard ceiling per getLogs request
+        getLogsSplitOnError: true       # bisect on 'range too large' from a public node
+        getLogsSplitConcurrency: 4      # gentle parallelism on free endpoints
+        emptyResultConfidence: finalizedBlock  # unfinalized empty (null receipt/tx) => not-yet-confirmed
+      failsafe:
+        - matchMethod: "eth_simulateV1|eth_call|eth_getCode|eth_getStorageAt"
+          matchFinality: [unfinalized, finalized]
+          consensus:
+            maxParticipants: 3
+            agreementThreshold: 2
+            disputeBehavior: returnError
+            lowParticipantsBehavior: acceptMostCommonValidResult
+            punishMisbehavior:
+              disputeThreshold: 5
+              disputeWindow: 5m
+              sitOutPenalty: 10m
+          retry:
+            maxAttempts: 3
+        # getLogs: dedicated rule (matched before "*"). No hedge — hedging heavy
+        # archive scans doubled free-tier load and let fast wrong-empty nodes win
+        # races. Higher empty-retry budget: a wrong [] (pruned node) is converted to
+        # missing-data (emptyResultConfidence=finalizedBlock) and retried on the
+        # next archive-log upstream instead of being accepted after 2 tries.
+        - matchMethod: "eth_getLogs"
+          retry:
+            maxAttempts: 4
+            delay: 0ms
+            backoffFactor: 1.5
+            backoffMaxDelay: 3s
+            emptyResultMaxAttempts: 4
+            emptyResultDelay: 200ms
+          timeout:
+            duration: 30s
+        - matchMethod: "*"
+          retry:
+            maxAttempts: 5
+            delay: 0ms
+            backoffFactor: 1.5
+            backoffMaxDelay: 3s
+            emptyResultMaxAttempts: 2
+            emptyResultDelay: 1s
+          hedge:
+            delay: 150ms
+            maxCount: 1
+          timeout:
+            duration: 20s
+
+    # ---- Network aliases = the URL slugs (rpc.7kt.org/<alias>) ----
+    networks:
+      - architecture: evm
+        alias: ethereum
+        evm: { chainId: 1, fallbackFinalityDepth: 64 }
+      - architecture: evm
+        alias: ethereum-sepolia
+        evm: { chainId: 11155111, fallbackFinalityDepth: 64 }
+      - architecture: evm
+        alias: base
+        evm: { chainId: 8453, fallbackFinalityDepth: 32 }
+      - architecture: evm
+        alias: base-sepolia
+        evm: { chainId: 84532, fallbackFinalityDepth: 32 }
+      - architecture: evm
+        alias: bsc
+        evm: { chainId: 56, fallbackFinalityDepth: 32 }
+      - architecture: evm
+        alias: bsc-testnet
+        evm: { chainId: 97, fallbackFinalityDepth: 32 }
+      - architecture: evm
+        alias: unichain
+        evm: { chainId: 130, fallbackFinalityDepth: 32 }
+      - architecture: evm
+        alias: unichain-sepolia
+        evm: { chainId: 1301, fallbackFinalityDepth: 32 }
+      - architecture: evm
+        alias: monad
+        evm: { chainId: 143, fallbackFinalityDepth: 32 }
+      - architecture: evm
+        alias: monad-testnet
+        evm: { chainId: 10143, fallbackFinalityDepth: 32 }
+      # ---- added: 7 major chains + Robinhood Chain (Arbitrum Orbit L2, launched 2026-07-01) ----
+      - architecture: evm
+        alias: polygon
+        evm: { chainId: 137, fallbackFinalityDepth: 128 }
+      - architecture: evm
+        alias: arbitrum
+        evm: { chainId: 42161, fallbackFinalityDepth: 64 }
+      - architecture: evm
+        alias: optimism
+        evm: { chainId: 10, fallbackFinalityDepth: 32 }
+      - architecture: evm
+        alias: fantom
+        evm: { chainId: 250, fallbackFinalityDepth: 32 }
+      - architecture: evm
+        alias: cronos
+        evm: { chainId: 25, fallbackFinalityDepth: 32 }
+      - architecture: evm
+        alias: gnosis
+        evm: { chainId: 100, fallbackFinalityDepth: 32 }
+      - architecture: evm
+        alias: avalanche
+        evm: { chainId: 43114, fallbackFinalityDepth: 32 }
+      - architecture: evm
+        alias: robinhood
+        evm: { chainId: 4663, fallbackFinalityDepth: 100 }   # ~100ms blocks (Orbit), only 1 public RPC today
+      # ---- added 2026-07-21: 11 mainnets the aa-security-auditor scans (thin ones carry a static upstream below) ----
+      - architecture: evm
+        alias: linea
+        evm: { chainId: 59144, fallbackFinalityDepth: 64 }
+      - architecture: evm
+        alias: worldchain
+        evm: { chainId: 480, fallbackFinalityDepth: 32 }
+      - architecture: evm
+        alias: hyperevm
+        evm: { chainId: 999, fallbackFinalityDepth: 32 }
+      - architecture: evm
+        alias: megaeth
+        evm: { chainId: 4326, fallbackFinalityDepth: 32 }
+      - architecture: evm
+        alias: sei
+        evm: { chainId: 1329, fallbackFinalityDepth: 32 }
+      - architecture: evm
+        alias: blast
+        evm: { chainId: 81457, fallbackFinalityDepth: 32 }
+      - architecture: evm
+        alias: mantle
+        evm: { chainId: 5000, fallbackFinalityDepth: 32 }
+      - architecture: evm
+        alias: katana
+        evm: { chainId: 747474, fallbackFinalityDepth: 32 }
+      - architecture: evm
+        alias: opbnb
+        evm: { chainId: 204, fallbackFinalityDepth: 32 }
+      - architecture: evm
+        alias: apechain
+        evm: { chainId: 33139, fallbackFinalityDepth: 32 }
+      - architecture: evm
+        alias: taiko
+        evm: { chainId: 167000, fallbackFinalityDepth: 32 }
+
+    # ---- extra PUBLIC upstreams (probed working, no key) — expand pool for less 429 + consensus ----
+    upstreams:
+      - id: x-ethereum-thirdweb
+        endpoint: https://1.rpc.thirdweb.com
+        evm: { chainId: 1 }
+        rateLimitBudget: public-node
+      - id: x-ethereum-publicnode
+        endpoint: https://ethereum.publicnode.com
+        evm: { chainId: 1 }
+        rateLimitBudget: public-node
+        ignoreMethods: ["eth_getLogs"]   # publicnode token-walls archive getLogs
+      - id: x-ethereum-sepolia-thirdweb
+        endpoint: https://11155111.rpc.thirdweb.com
+        evm: { chainId: 11155111 }
+        rateLimitBudget: public-node
+      - id: x-base-thirdweb
+        endpoint: https://8453.rpc.thirdweb.com
+        evm: { chainId: 8453 }
+        rateLimitBudget: public-node
+      - id: x-base-publicnode
+        endpoint: https://base.publicnode.com
+        evm: { chainId: 8453 }
+        rateLimitBudget: public-node
+        ignoreMethods: ["eth_getLogs"]   # publicnode now token-walls archive getLogs (loud error, wasted attempt)
+      # ---- base archive-log upstreams (each verified 2026-07-13: full logs at head-12k,
+      #      10596/10596 vs ground truth) — the ONLY getLogs servers for base ----
+      - id: x-base-org
+        endpoint: https://mainnet.base.org
+        evm: { chainId: 8453 }
+        rateLimitBudget: public-node
+      - id: x-base-developer
+        endpoint: https://developer-access-mainnet.base.org
+        evm: { chainId: 8453 }
+        rateLimitBudget: public-node
+      - id: x-base-preconf
+        endpoint: https://mainnet-preconf.base.org
+        evm: { chainId: 8453 }
+        rateLimitBudget: public-node
+      - id: x-base-tenderly
+        endpoint: https://base.gateway.tenderly.co
+        evm: { chainId: 8453 }
+        rateLimitBudget: public-node
+      - id: x-base-lava
+        endpoint: https://base.lava.build
+        evm: { chainId: 8453 }
+        rateLimitBudget: public-node
+      - id: x-base-sepolia-thirdweb
+        endpoint: https://84532.rpc.thirdweb.com
+        evm: { chainId: 84532 }
+        rateLimitBudget: public-node
+      - id: x-bsc-publicnode
+        endpoint: https://bsc.publicnode.com
+        evm: { chainId: 56 }
+        rateLimitBudget: public-node
+        ignoreMethods: ["eth_getLogs"]   # publicnode token-walls archive getLogs
+      - id: x-bsc-nodies
+        endpoint: https://bsc-pokt.nodies.app
+        evm: { chainId: 56 }
+        rateLimitBudget: public-node
+      - id: x-bsc-testnet-thirdweb
+        endpoint: https://97.rpc.thirdweb.com
+        evm: { chainId: 97 }
+        rateLimitBudget: public-node
+      - id: x-unichain-thirdweb
+        endpoint: https://130.rpc.thirdweb.com
+        evm: { chainId: 130 }
+        rateLimitBudget: public-node
+      - id: x-unichain-sepolia-thirdweb
+        endpoint: https://1301.rpc.thirdweb.com
+        evm: { chainId: 1301 }
+        rateLimitBudget: public-node
+      - id: x-monad-thirdweb
+        endpoint: https://143.rpc.thirdweb.com
+        evm: { chainId: 143 }
+        rateLimitBudget: public-node
+      - id: x-monad-drpc
+        endpoint: https://monad.drpc.org
+        evm: { chainId: 143 }
+        rateLimitBudget: public-node
+      - id: x-monad-testnet-thirdweb
+        endpoint: https://10143.rpc.thirdweb.com
+        evm: { chainId: 10143 }
+        rateLimitBudget: public-node
+      # ---- added chains: curated endpoints (each probed eth_chainId OK) — repository vendor adds more for the majors ----
+      - id: x-polygon-publicnode
+        endpoint: https://polygon-bor-rpc.publicnode.com
+        evm: { chainId: 137 }
+        rateLimitBudget: public-node
+        ignoreMethods: ["eth_getLogs"]   # publicnode token-walls archive getLogs
+      - id: x-polygon-thirdweb
+        endpoint: https://137.rpc.thirdweb.com
+        evm: { chainId: 137 }
+        rateLimitBudget: public-node
+      - id: x-arbitrum-publicnode
+        endpoint: https://arbitrum-one-rpc.publicnode.com
+        evm: { chainId: 42161 }
+        rateLimitBudget: public-node
+        ignoreMethods: ["eth_getLogs"]   # publicnode token-walls archive getLogs
+      - id: x-arbitrum-thirdweb
+        endpoint: https://42161.rpc.thirdweb.com
+        evm: { chainId: 42161 }
+        rateLimitBudget: public-node
+      - id: x-optimism-publicnode
+        endpoint: https://optimism-rpc.publicnode.com
+        evm: { chainId: 10 }
+        rateLimitBudget: public-node
+        ignoreMethods: ["eth_getLogs"]   # publicnode token-walls archive getLogs
+      - id: x-optimism-thirdweb
+        endpoint: https://10.rpc.thirdweb.com
+        evm: { chainId: 10 }
+        rateLimitBudget: public-node
+      - id: x-fantom-drpc
+        endpoint: https://fantom.drpc.org
+        evm: { chainId: 250 }
+        rateLimitBudget: public-node
+      - id: x-fantom-1rpc
+        endpoint: https://1rpc.io/ftm
+        evm: { chainId: 250 }
+        rateLimitBudget: public-node
+        ignoreMethods: ["eth_getLogs"]   # 50-block getLogs cap
+      - id: x-fantom-thirdweb
+        endpoint: https://250.rpc.thirdweb.com
+        evm: { chainId: 250 }
+        rateLimitBudget: public-node
+      - id: x-cronos-publicnode
+        endpoint: https://cronos-evm-rpc.publicnode.com
+        evm: { chainId: 25 }
+        rateLimitBudget: public-node
+        ignoreMethods: ["eth_getLogs"]   # publicnode token-walls archive getLogs
+      - id: x-cronos-thirdweb
+        endpoint: https://25.rpc.thirdweb.com
+        evm: { chainId: 25 }
+        rateLimitBudget: public-node
+      - id: x-gnosis-publicnode
+        endpoint: https://gnosis-rpc.publicnode.com
+        evm: { chainId: 100 }
+        rateLimitBudget: public-node
+        ignoreMethods: ["eth_getLogs"]   # publicnode token-walls archive getLogs
+      - id: x-gnosis-thirdweb
+        endpoint: https://100.rpc.thirdweb.com
+        evm: { chainId: 100 }
+        rateLimitBudget: public-node
+      - id: x-avalanche-publicnode
+        endpoint: https://avalanche-c-chain-rpc.publicnode.com
+        evm: { chainId: 43114 }
+        rateLimitBudget: public-node
+        ignoreMethods: ["eth_getLogs"]   # publicnode token-walls archive getLogs
+      - id: x-avalanche-thirdweb
+        endpoint: https://43114.rpc.thirdweb.com
+        evm: { chainId: 43114 }
+        rateLimitBudget: public-node
+      - id: x-robinhood-official
+        endpoint: https://rpc.mainnet.chain.robinhood.com
+        evm: { chainId: 4663 }
+        rateLimitBudget: public-node
+
+      # ==== curated archive-log getLogs servers (each probed ARCHIVE-OK 2026-07-13 vs >=2
+      # ==== cross-refs on deep history; repo pools of restricted chains have getLogs off) ====
+      - id: x-eth-0xrpc
+        endpoint: https://0xrpc.io/eth
+        evm: { chainId: 1 }
+        rateLimitBudget: public-node
+      - id: x-eth-onfinality
+        endpoint: https://eth.api.onfinality.io/public
+        evm: { chainId: 1 }
+        rateLimitBudget: public-node
+      - id: x-eth-tenderly
+        endpoint: https://mainnet.gateway.tenderly.co
+        evm: { chainId: 1 }
+        rateLimitBudget: public-node
+      - id: x-eth-drpc
+        endpoint: https://eth.drpc.org
+        evm: { chainId: 1 }
+        rateLimitBudget: public-node
+      - id: x-eth-nodies
+        endpoint: https://ethereum-public.nodies.app
+        evm: { chainId: 1 }
+        rateLimitBudget: public-node
+      - id: x-eth-blockpi
+        endpoint: https://ethereum.public.blockpi.network/v1/rpc/public
+        evm: { chainId: 1 }
+        rateLimitBudget: public-node
+      - id: x-sepolia-0xrpc
+        endpoint: https://0xrpc.io/sep
+        evm: { chainId: 11155111 }
+        rateLimitBudget: public-node
+      - id: x-sepolia-onfinality
+        endpoint: https://eth-sepolia.api.onfinality.io/public
+        evm: { chainId: 11155111 }
+        rateLimitBudget: public-node
+      - id: x-sepolia-tenderly
+        endpoint: https://sepolia.gateway.tenderly.co
+        evm: { chainId: 11155111 }
+        rateLimitBudget: public-node
+      - id: x-base-sepolia-org
+        endpoint: https://sepolia.base.org
+        evm: { chainId: 84532 }
+        rateLimitBudget: public-node
+      - id: x-base-sepolia-preconf
+        endpoint: https://sepolia-preconf.base.org
+        evm: { chainId: 84532 }
+        rateLimitBudget: public-node
+      - id: x-base-sepolia-tenderly
+        endpoint: https://base-sepolia.gateway.tenderly.co
+        evm: { chainId: 84532 }
+        rateLimitBudget: public-node
+      - id: x-base-sepolia-onfinality
+        endpoint: https://base-sepolia.api.onfinality.io/public
+        evm: { chainId: 84532 }
+        rateLimitBudget: public-node
+      - id: x-bsc-onfinality
+        endpoint: https://bnb.api.onfinality.io/public
+        evm: { chainId: 56 }
+        rateLimitBudget: public-node
+      - id: x-bsc-blxr
+        endpoint: https://bsc.rpc.blxrbdn.com
+        evm: { chainId: 56 }
+        rateLimitBudget: public-node
+      - id: x-bsc-nodereal
+        endpoint: https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3   # public shared key from erpc repository list
+        evm: { chainId: 56 }
+        rateLimitBudget: public-node
+      - id: x-bsc-testnet-onfinality
+        endpoint: https://bnb-testnet.api.onfinality.io/public
+        evm: { chainId: 97 }
+        rateLimitBudget: public-node
+      - id: x-polygon-tenderly
+        endpoint: https://polygon.gateway.tenderly.co
+        evm: { chainId: 137 }
+        rateLimitBudget: public-node
+      - id: x-polygon-nodies
+        endpoint: https://polygon-public.nodies.app
+        evm: { chainId: 137 }
+        rateLimitBudget: public-node
+      - id: x-polygon-onfinality
+        endpoint: https://polygon.api.onfinality.io/public
+        evm: { chainId: 137 }
+        rateLimitBudget: public-node
+      - id: x-polygon-drpc
+        endpoint: https://polygon.drpc.org
+        evm: { chainId: 137 }
+        rateLimitBudget: public-node
+      - id: x-polygon-quiknode
+        endpoint: https://rpc-mainnet.matic.quiknode.pro
+        evm: { chainId: 137 }
+        rateLimitBudget: public-node
+      - id: x-arbitrum-official
+        endpoint: https://arb1.arbitrum.io/rpc
+        evm: { chainId: 42161 }
+        rateLimitBudget: public-node
+      - id: x-arbitrum-tenderly
+        endpoint: https://arbitrum.gateway.tenderly.co
+        evm: { chainId: 42161 }
+        rateLimitBudget: public-node
+      - id: x-arbitrum-nodies
+        endpoint: https://arbitrum-one-public.nodies.app
+        evm: { chainId: 42161 }
+        rateLimitBudget: public-node
+      - id: x-optimism-official
+        endpoint: https://mainnet.optimism.io
+        evm: { chainId: 10 }
+        rateLimitBudget: public-node
+      - id: x-optimism-tenderly
+        endpoint: https://optimism.gateway.tenderly.co
+        evm: { chainId: 10 }
+        rateLimitBudget: public-node
+      - id: x-optimism-drpc
+        endpoint: https://optimism.drpc.org
+        evm: { chainId: 10 }
+        rateLimitBudget: public-node
+      - id: x-optimism-blockpi
+        endpoint: https://optimism.public.blockpi.network/v1/rpc/public
+        evm: { chainId: 10 }
+        rateLimitBudget: public-node
+      - id: x-optimism-onfinality
+        endpoint: https://optimism.api.onfinality.io/public
+        evm: { chainId: 10 }
+        rateLimitBudget: public-node
+      - id: x-fantom-official
+        endpoint: https://rpcapi.fantom.network
+        evm: { chainId: 250 }
+        rateLimitBudget: public-node
+      - id: x-fantom-official2
+        endpoint: https://rpc.fantom.network
+        evm: { chainId: 250 }
+        rateLimitBudget: public-node
+      - id: x-avalanche-official
+        endpoint: https://api.avax.network/ext/bc/C/rpc
+        evm: { chainId: 43114 }
+        rateLimitBudget: public-node
+      - id: x-avalanche-tenderly
+        endpoint: https://avalanche-mainnet.gateway.tenderly.co
+        evm: { chainId: 43114 }
+        rateLimitBudget: public-node
+      - id: x-avalanche-onfinality
+        endpoint: https://avalanche.api.onfinality.io/public/ext/bc/C/rpc
+        evm: { chainId: 43114 }
+        rateLimitBudget: public-node
+      - id: x-avalanche-drpc
+        endpoint: https://avalanche.drpc.org
+        evm: { chainId: 43114 }
+        rateLimitBudget: public-node
+      # ---- additive coverage on OPEN chains (no silent-emptier found; repo getLogs stays on) ----
+      - id: x-cronos-official
+        endpoint: https://evm.cronos.org
+        evm: { chainId: 25 }
+        rateLimitBudget: public-node
+      - id: x-cronos-vvs
+        endpoint: https://rpc.vvs.finance
+        evm: { chainId: 25 }
+        rateLimitBudget: public-node
+      - id: x-unichain-official
+        endpoint: https://mainnet.unichain.org
+        evm: { chainId: 130 }
+        rateLimitBudget: public-node
+      - id: x-unichain-sepolia-official
+        endpoint: https://sepolia.unichain.org
+        evm: { chainId: 1301 }
+        rateLimitBudget: public-node
+      - id: x-monad-official
+        endpoint: https://rpc.monad.xyz
+        evm: { chainId: 143 }
+        rateLimitBudget: public-node
+      # ---- added 2026-07-21: static upstreams for thin new chains (URLs validated live by the bounty tool's lib/chains.json) ----
+      # linea/worldchain/megaeth/sei/blast/mantle rely on the repository catalog (+ keyed vendors once ENVIO/ALCHEMY/DRPC keys are set).
+      - id: x-katana-static
+        endpoint: https://rpc.katana.network/
+        evm: { chainId: 747474 }
+        rateLimitBudget: public-node
+      - id: x-opbnb-static
+        endpoint: https://opbnb.drpc.org
+        evm: { chainId: 204 }
+        rateLimitBudget: public-node
+      - id: x-apechain-static
+        endpoint: https://apechain.calderachain.xyz/http
+        evm: { chainId: 33139 }
+        rateLimitBudget: public-node
+      - id: x-taiko-static
+        endpoint: https://rpc.mainnet.taiko.xyz
+        evm: { chainId: 167000 }
+        rateLimitBudget: public-node
+      - id: x-hyperevm-static
+        endpoint: https://rpc.hyperliquid.xyz/evm
+        evm: { chainId: 999 }
+        rateLimitBudget: public-node
+
+    providers:
+      - id: public-repo
+        vendor: repository
+        onlyNetworks: &targets ["evm:1", "evm:11155111", "evm:8453", "evm:84532", "evm:56", "evm:97", "evm:130", "evm:1301", "evm:10143", "evm:143", "evm:137", "evm:42161", "evm:10", "evm:250", "evm:25", "evm:100", "evm:43114", "evm:4663", "evm:59144", "evm:480", "evm:999", "evm:4326", "evm:1329", "evm:81457", "evm:5000", "evm:747474", "evm:204", "evm:33139", "evm:167000"]
+        # NOTE: override patterns are matched in RANDOM map order (first match wins) —
+        # never mix "evm:*" with a specific "evm:<id>" key; enumerate explicitly instead.
+        overrides:
+          # base(8453): repo pool contains silent-empty pruned nodes for eth_getLogs
+          # (blockpi indexes only ~last 11k blocks and returns [] for older ranges —
+          # incident 2026-07-13) plus many range-capped nodes (10..250 block limits).
+          # getLogs is served ONLY by the curated x-base-* archive-log upstreams below.
+          "evm:8453":
+            rateLimitBudget: public-node
+            ignoreMethods: ["eth_getLogs"]
+          "evm:1": { rateLimitBudget: public-node, ignoreMethods: ["eth_getLogs"] }
+          "evm:11155111": { rateLimitBudget: public-node, ignoreMethods: ["eth_getLogs"] }
+          "evm:84532": { rateLimitBudget: public-node, ignoreMethods: ["eth_getLogs"] }
+          "evm:56": { rateLimitBudget: public-node, ignoreMethods: ["eth_getLogs"] }
+          "evm:97": { rateLimitBudget: public-node }
+          "evm:130": { rateLimitBudget: public-node }
+          "evm:1301": { rateLimitBudget: public-node }
+          "evm:10143": { rateLimitBudget: public-node }
+          "evm:143": { rateLimitBudget: public-node }
+          "evm:137": { rateLimitBudget: public-node, ignoreMethods: ["eth_getLogs"] }
+          "evm:42161": { rateLimitBudget: public-node, ignoreMethods: ["eth_getLogs"] }
+          "evm:10": { rateLimitBudget: public-node, ignoreMethods: ["eth_getLogs"] }
+          "evm:250": { rateLimitBudget: public-node, ignoreMethods: ["eth_getLogs"] }
+          "evm:25": { rateLimitBudget: public-node }
+          "evm:100": { rateLimitBudget: public-node }
+          "evm:43114": { rateLimitBudget: public-node, ignoreMethods: ["eth_getLogs"] }
+          "evm:4663": { rateLimitBudget: public-node }
+          # ---- added 2026-07-21 (getLogs left ON: not yet probed for silent-emptiers; integrity validators + static/keyed upstreams guard correctness) ----
+          "evm:59144": { rateLimitBudget: public-node }
+          "evm:480": { rateLimitBudget: public-node }
+          "evm:999": { rateLimitBudget: public-node }
+          "evm:4326": { rateLimitBudget: public-node }
+          "evm:1329": { rateLimitBudget: public-node }
+          "evm:81457": { rateLimitBudget: public-node }
+          "evm:5000": { rateLimitBudget: public-node }
+          "evm:747474": { rateLimitBudget: public-node }
+          "evm:204": { rateLimitBudget: public-node }
+          "evm:33139": { rateLimitBudget: public-node }
+          "evm:167000": { rateLimitBudget: public-node }
+      - id: envio
+        vendor: envio
+        settings:
+          rootDomain: rpc.hypersync.xyz
+          apiKey: ${ENVIO_API_KEY}
+        onlyNetworks: *targets
+        overrides:
+          "evm:*":
+            rateLimitBudget: envio-budget
+      - id: alchemy
+        vendor: alchemy
+        settings:
+          apiKey: ${ALCHEMY_API_KEY}
+        onlyNetworks: *targets
+        overrides:
+          "evm:*":
+            rateLimitBudget: keyed-node
+      - id: drpc
+        vendor: drpc
+        settings:
+          apiKey: ${DRPC_API_KEY}
+        onlyNetworks: *targets
+        overrides:
+          "evm:*":
+            rateLimitBudget: keyed-node
+
+  - id: plinko
+    # ISOLATED lane for the Plinko game-server resolver. `main` requires 2/3 upstream consensus on eth_call, but
+    # Monad testnet public nodes are pruned/load-balanced and DISAGREE on rounds() → "not enough agreement" → the
+    # resolver cannot read round state → nothing settles. Here: NO consensus, just failover + retry over one
+    # upstream per call → a consistent answer. Additive; touches no other lane.
+    upstreamDefaults:
+      evm:
+        statePollerInterval: 15s
+    networkDefaults:
+      evm:
+        getLogsMaxAllowedRange: 10000
+        getLogsSplitOnError: true
+      failsafe:
+        - matchMethod: "*"
+          retry:
+            maxAttempts: 4
+            delay: 100ms
+            backoffFactor: 1.5
+            backoffMaxDelay: 3s
+          timeout:
+            duration: 25s
+    networks:
+      - architecture: evm
+        alias: monad-testnet
+        evm: { chainId: 10143, fallbackFinalityDepth: 32 }
+    upstreams:
+      - id: pl-monad-official
+        endpoint: https://testnet-rpc.monad.xyz
+        evm: { chainId: 10143 }

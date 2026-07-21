@@ -11,7 +11,9 @@ vendor/
 *.cover
 coverage.txt
 .DS_Store
-erpc.yaml
+# erpc.yaml is TRACKED: it holds no secrets (keys come from ${ENV} placeholders) and
+# version-control here is what prevents server config drift on redeploy. Keep real
+# secrets in .env (ignored below) only.
 erpc-*.yaml
 erpc.ts
 .generated-go-semantic-release-changelog.md
