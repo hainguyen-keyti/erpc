@@ -651,7 +651,7 @@ projects:
         evm: { chainId: 143 }
         rateLimitBudget: public-node
       # ---- added 2026-07-21: static upstreams for thin new chains (URLs validated live by the bounty tool's lib/chains.json) ----
-      # linea/worldchain/megaeth/sei/blast/mantle rely on the repository catalog (+ keyed vendors once ENVIO/ALCHEMY/DRPC keys are set).
+      # linea/worldchain/sei/blast/mantle rely on the repository catalog (+ keyed vendors once ENVIO/ALCHEMY/DRPC keys are set).
       - id: x-katana-static
         endpoint: https://rpc.katana.network/
         evm: { chainId: 747474 }
@@ -671,6 +671,15 @@ projects:
       - id: x-hyperevm-static
         endpoint: https://rpc.hyperliquid.xyz/evm
         evm: { chainId: 999 }
+        rateLimitBudget: public-node
+      # megaeth(4326): the ONLY working public endpoint. Probed from this server 2026-07-21 —
+      # eth_chainId 0x10e6, `finalized` + `safe` tags supported (so fallbackFinalityDepth is only a
+      # backstop), eth_call / eth_getCode OK, archive getLogs OK at head-500k, ~61ms, ~0.85s blocks.
+      # Rejected alternatives: 4326.rpc.thirdweb.com (rate-limited, demands an API key),
+      # megaeth.drpc.org (429 "Too many request"). Before this, evm:4326 had ZERO upstreams.
+      - id: x-megaeth-official
+        endpoint: https://mainnet.megaeth.com/rpc
+        evm: { chainId: 4326 }
         rateLimitBudget: public-node
 
     providers:
